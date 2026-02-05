@@ -1,0 +1,12 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# OS specific
+.DS_Store
+Thumbs.db
