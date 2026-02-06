@@ -10,3 +10,8 @@
 # OS specific
 .DS_Store
 Thumbs.db
+
+#ENDOF template
+
+proxy.txt
+out_*.txt

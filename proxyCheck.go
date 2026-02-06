@@ -1,238 +1,309 @@
 package main
 
 import (
-    "bufio"
-    "context"
-    "encoding/csv"
-    "encoding/json"
-    "fmt"
-    "io"
-    "net"
-    "net/http"
-    "os"
-    "sort"
-    "strings"
-    "sync"
-    "time"
+	"bufio"
+	"context"
+	"encoding/csv"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"sort"
+	"strings"
+	"sync"
+	"time"
 
-    "golang.org/x/net/proxy"
+	"golang.org/x/net/proxy"
 )
 
 type CheckResult struct {
-    OriginalLine string
-    IP           string
-    Country      string
-    ResponseTime float64
-    Success      bool
+	OriginalLine string
+	IP           string
+	Country      string
+	ResponseTime float64
+	Success      bool
+	Error        string
 }
 
 type JSONResponse struct {
-    Proxy struct {
-        IP string `json:"ip"`
-    } `json:"proxy"`
-    Country struct {
-        Name string `json:"name"`
-    } `json:"country"`
+	Proxy struct {
+		IP string `json:"ip"`
+	} `json:"proxy"`
+	Country struct {
+		Name string `json:"name"`
+	} `json:"country"`
 }
 
 func main() {
-    inputFile := "data.csv"
-    outputFile := "proxy_details.csv"
-    concurrency := 500
-    targetURL := "https://ip.decodo.com/json"
+	var inputFile string
+	var outputFile string
+	var concurrency int
+	var targetURL string
+	var protocol string
+	var showHelp bool
+	var verbose bool
 
-    file, err := os.Open(inputFile)
-    if err != nil {
-        fmt.Printf("Failed to open %s: %v\n", inputFile, err)
-        return
-    }
-    defer file.Close()
+	// Custom Usage
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
+		fmt.Fprintln(os.Stderr, "Options:")
+		fmt.Fprintln(os.Stderr, "  -i, --input string    Path to the input CSV file containing proxies (default \"data.csv\")")
+		fmt.Fprintln(os.Stderr, "  -o, --output string   Path to the output CSV file (default \"proxy_details.csv\")")
+		fmt.Fprintln(os.Stderr, "  -t, --threads int     Number of concurrent threads (default 500)")
+		fmt.Fprintln(os.Stderr, "  -p, --protocol string Proxy protocol: socks5, http, https (default \"socks5\")")
+		fmt.Fprintln(os.Stderr, "      --target string   Target URL to check proxies against (default \"https://ip.decodo.com/json\")")
+		fmt.Fprintln(os.Stderr, "  -v, --verbose         Show detailed error logs")
+		fmt.Fprintln(os.Stderr, "  -h, --help            Show help message")
+	}
 
-    var lines []string
-    scanner := bufio.NewScanner(file)
-    for scanner.Scan() {
-        line := strings.TrimSpace(scanner.Text())
-        if line != "" {
-            lines = append(lines, line)
-        }
-    }
+	// Input file
+	flag.StringVar(&inputFile, "input", "data.csv", "")
+	flag.StringVar(&inputFile, "i", "data.csv", "")
 
-    totalProxies := len(lines)
-    fmt.Printf("Starting check for %d proxies with %d goroutines...\n", totalProxies, concurrency)
+	// Output file
+	flag.StringVar(&outputFile, "output", "proxy_details.csv", "")
+	flag.StringVar(&outputFile, "o", "proxy_details.csv", "")
 
-    resultsChan := make(chan CheckResult, totalProxies)
-    var wg sync.WaitGroup
-    sem := make(chan struct{}, concurrency)
+	// Threads
+	flag.IntVar(&concurrency, "threads", 500, "")
+	flag.IntVar(&concurrency, "t", 500, "")
 
-    counter := 0
-    var mu sync.Mutex
+	// Protocol
+	flag.StringVar(&protocol, "protocol", "socks5", "")
+	flag.StringVar(&protocol, "p", "socks5", "")
 
-    for _, line := range lines {
-        wg.Add(1)
-        sem <- struct{}{} // Acquire semaphore
-        go func(l string) {
-            defer wg.Done()
-            defer func() { <-sem }() // Release
+	// Target
+	flag.StringVar(&targetURL, "target", "https://ip.decodo.com/json", "")
 
-            res := checkProxy(l, targetURL)
+	// Verbose
+	flag.BoolVar(&verbose, "verbose", false, "")
+	flag.BoolVar(&verbose, "v", false, "")
 
-            mu.Lock()
-            counter++
-            fmt.Printf("\rChecked %d/%d (Working: %s)         ", counter, totalProxies, res.IP)
-            mu.Unlock()
+	// Help
+	flag.BoolVar(&showHelp, "help", false, "")
+	flag.BoolVar(&showHelp, "h", false, "")
 
-            resultsChan <- res
-        }(line)
-    }
+	flag.Parse()
 
-    wg.Wait()
-    close(resultsChan)
-    fmt.Println("\n\nProcessing results...")
+	if showHelp {
+		flag.Usage()
+		return
+	}
 
-    var workingResults []CheckResult
-    countryCounts := make(map[string]int)
-    var totalTime float64
+	file, err := os.Open(inputFile)
+	if err != nil {
+		fmt.Printf("Failed to open %s: %v\n", inputFile, err)
+		return
+	}
+	defer file.Close()
 
-    for res := range resultsChan {
-        if res.Success {
-            workingResults = append(workingResults, res)
-            countryCounts[res.Country]++
-            totalTime += res.ResponseTime
-        }
-    }
+	var lines []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
 
-    // Save to CSV
-    outFile, err := os.Create(outputFile)
-    if err != nil {
-        fmt.Printf("Failed to create %s: %v\n", outputFile, err)
-        return
-    }
-    defer outFile.Close()
+	totalProxies := len(lines)
+	fmt.Printf("Starting check for %d proxies with %d goroutines using %s...\n", totalProxies, concurrency, protocol)
 
-    writer := csv.NewWriter(outFile)
-    defer writer.Flush()
+	resultsChan := make(chan CheckResult, totalProxies)
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, concurrency)
 
-    writer.Write([]string{"original_line", "ip", "country", "response_time"})
-    for _, res := range workingResults {
-        writer.Write([]string{
-            res.OriginalLine,
-            res.IP,
-            res.Country,
-            fmt.Sprintf("%.4f", res.ResponseTime),
-        })
-    }
+	counter := 0
+	var mu sync.Mutex
 
-    // Print Summary
-    totalWorking := len(workingResults)
-    avgTime := 0.0
-    if totalWorking > 0 {
-        avgTime = totalTime / float64(totalWorking)
-    }
+	for _, line := range lines {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(l string) {
+			defer wg.Done()
+			defer func() { <-sem }()
 
-    fmt.Println(strings.Repeat("-", 30))
-    fmt.Printf("Total Working Proxies: %d\n", totalWorking)
-    fmt.Printf("Average Response Time: %.2fs\n", avgTime)
-    fmt.Println(strings.Repeat("-", 30))
-    fmt.Println("By Country:")
+			res := checkProxy(l, targetURL, protocol)
 
-    // Sort countries by count
-    type CountryCount struct {
-        Name  string
-        Count int
-    }
-    var sortedCountries []CountryCount
-    for name, count := range countryCounts {
-        sortedCountries = append(sortedCountries, CountryCount{name, count})
-    }
-    sort.Slice(sortedCountries, func(i, j int) bool {
-        return sortedCountries[i].Count > sortedCountries[j].Count
-    })
+			mu.Lock()
+			counter++
+			if verbose && res.Error != "" {
+				fmt.Printf("\n[ERROR] %s: %s\n", res.OriginalLine, res.Error)
+			}
+			fmt.Printf("\rChecked %d/%d (Working: %s)         ", counter, totalProxies, res.IP)
+			mu.Unlock()
 
-    for _, cc := range sortedCountries {
-        fmt.Printf("%s: %d\n", cc.Name, cc.Count)
-    }
-    fmt.Println(strings.Repeat("-", 30))
-    fmt.Printf("Detailed results saved to '%s'\n", outputFile)
+			resultsChan <- res
+		}(line)
+	}
+
+	wg.Wait()
+	close(resultsChan)
+	fmt.Println("\n\nProcessing results...")
+
+	var workingResults []CheckResult
+	countryCounts := make(map[string]int)
+	var totalTime float64
+
+	for res := range resultsChan {
+		if res.Success {
+			workingResults = append(workingResults, res)
+			countryCounts[res.Country]++
+			totalTime += res.ResponseTime
+		}
+	}
+
+	// save CSV
+	outFile, err := os.Create(outputFile)
+	if err != nil {
+		fmt.Printf("Failed to create %s: %v\n", outputFile, err)
+		return
+	}
+	defer outFile.Close()
+
+	writer := csv.NewWriter(outFile)
+	defer writer.Flush()
+
+	writer.Write([]string{"original_line", "ip", "country", "response_time"})
+	for _, res := range workingResults {
+		writer.Write([]string{
+			res.OriginalLine,
+			res.IP,
+			res.Country,
+			fmt.Sprintf("%.4f", res.ResponseTime),
+		})
+	}
+
+	// print Summary
+	totalWorking := len(workingResults)
+	avgTime := 0.0
+	if totalWorking > 0 {
+		avgTime = totalTime / float64(totalWorking)
+	}
+
+	fmt.Println(strings.Repeat("-", 30))
+	fmt.Printf("Total Working Proxies: %d\n", totalWorking)
+	fmt.Printf("Average Response Time: %.2fs\n", avgTime)
+	fmt.Println(strings.Repeat("-", 30))
+	fmt.Println("By Country:")
+
+	// sort countries by count
+	type CountryCount struct {
+		Name  string
+		Count int
+	}
+	var sortedCountries []CountryCount
+	for name, count := range countryCounts {
+		sortedCountries = append(sortedCountries, CountryCount{name, count})
+	}
+	sort.Slice(sortedCountries, func(i, j int) bool {
+		return sortedCountries[i].Count > sortedCountries[j].Count
+	})
+
+	for _, cc := range sortedCountries {
+		fmt.Printf("%s: %d\n", cc.Name, cc.Count)
+	}
+	fmt.Println(strings.Repeat("-", 30))
+	fmt.Printf("Detailed results saved to '%s'\n", outputFile)
 }
 
-func checkProxy(line, targetURL string) CheckResult {
+func checkProxy(line, targetURL, protocol string) CheckResult {
 	res := CheckResult{OriginalLine: line}
 
 	var host, port, user, pass string
 
-	if strings.HasPrefix(line, "socks5h://") {
-		trimmed := strings.TrimPrefix(line, "socks5h://")
-		if strings.Contains(trimmed, "@") {
-			parts := strings.SplitN(trimmed, "@", 2)
-			authPart := parts[0]
-			addrPart := parts[1]
-			authParts := strings.SplitN(authPart, ":", 2)
-			if len(authParts) == 2 {
-				user, pass = authParts[0], authParts[1]
-			}
-			addrParts := strings.SplitN(addrPart, ":", 2)
-			if len(addrParts) == 2 {
-				host, port = addrParts[0], addrParts[1]
-			}
-		} else {
-			addrParts := strings.SplitN(trimmed, ":", 2)
-			if len(addrParts) == 2 {
-				host, port = addrParts[0], addrParts[1]
-			}
+	toParse := line
+	if strings.HasPrefix(toParse, "socks5://") {
+		toParse = strings.TrimPrefix(toParse, "socks5://")
+	} else if strings.HasPrefix(toParse, "socks5h://") {
+		toParse = strings.TrimPrefix(toParse, "socks5h://")
+	} else if strings.HasPrefix(toParse, "http://") {
+		toParse = strings.TrimPrefix(toParse, "http://")
+	} else if strings.HasPrefix(toParse, "https://") {
+		toParse = strings.TrimPrefix(toParse, "https://")
+	}
+
+	if strings.Contains(toParse, "@") {
+		parts := strings.SplitN(toParse, "@", 2)
+		authPart := parts[0]
+		addrPart := parts[1]
+		authParts := strings.SplitN(authPart, ":", 2)
+		if len(authParts) == 2 {
+			user, pass = authParts[0], authParts[1]
 		}
-	} else if strings.HasPrefix(line, "socks5://") {
-		trimmed := strings.TrimPrefix(line, "socks5://")
-		if strings.Contains(trimmed, "@") {
-			parts := strings.SplitN(trimmed, "@", 2)
-			authPart := parts[0]
-			addrPart := parts[1]
-			authParts := strings.SplitN(authPart, ":", 2)
-			if len(authParts) == 2 {
-				user, pass = authParts[0], authParts[1]
-			}
-			addrParts := strings.SplitN(addrPart, ":", 2)
-			if len(addrParts) == 2 {
-				host, port = addrParts[0], addrParts[1]
-			}
-		} else {
-			addrParts := strings.SplitN(trimmed, ":", 2)
-			if len(addrParts) == 2 {
-				host, port = addrParts[0], addrParts[1]
-			}
+		addrParts := strings.SplitN(addrPart, ":", 2)
+		if len(addrParts) == 2 {
+			host, port = addrParts[0], addrParts[1]
 		}
 	} else {
-		parts := strings.Split(line, ":")
+		parts := strings.Split(toParse, ":")
 		if len(parts) == 4 {
 			host, port, user, pass = parts[0], parts[1], parts[2], parts[3]
 		} else if len(parts) == 2 {
 			host, port = parts[0], parts[1]
 		} else {
+			res.Error = "Invalid format"
 			return res
 		}
 	}
 
+	if strings.Contains(pass, ",") {
+		pass = strings.Split(pass, ",")[0]
+	}
+	if strings.Contains(port, ",") {
+		port = strings.Split(port, ",")[0]
+	}
+
 	if host == "" || port == "" {
+		res.Error = "Empty host or port"
 		return res
 	}
 
-	// Create SOCKS5 dialer
-	var auth *proxy.Auth
-	if user != "" && pass != "" {
-		auth = &proxy.Auth{User: user, Password: pass}
-	}
+	var transport *http.Transport
 
-	dialer, err := proxy.SOCKS5("tcp", fmt.Sprintf("%s:%s", host, port), auth, proxy.Direct)
-	if err != nil {
-		return res
-	}
+	if strings.ToLower(protocol) == "http" || strings.ToLower(protocol) == "https" {
+		// HTTP
+		proxyURLStr := fmt.Sprintf("http://%s:%s", host, port)
+		if user != "" && pass != "" {
+			proxyURLStr = fmt.Sprintf("http://%s:%s@%s:%s", user, pass, host, port)
+		}
+		
+		proxyURL, err := url.Parse(proxyURLStr)
+		if err != nil {
+			res.Error = fmt.Sprintf("URL parse error: %v", err)
+			return res
+		}
 
-	// Create HTTP transport with the dialer
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return dialer.Dial(network, addr)
-		},
-		DisableKeepAlives:   true,
-		TLSHandshakeTimeout: 10 * time.Second,
+		transport = &http.Transport{
+			Proxy:               http.ProxyURL(proxyURL),
+			DisableKeepAlives:   true,
+			TLSHandshakeTimeout: 10 * time.Second,
+		}
+
+	} else {
+		// SOCKS5
+		var auth *proxy.Auth
+		if user != "" && pass != "" {
+			auth = &proxy.Auth{User: user, Password: pass}
+		}
+
+		dialer, err := proxy.SOCKS5("tcp", fmt.Sprintf("%s:%s", host, port), auth, proxy.Direct)
+		if err != nil {
+			res.Error = fmt.Sprintf("SOCKS5 dialer error: %v", err)
+			return res
+		}
+
+		transport = &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialer.Dial(network, addr)
+			},
+			DisableKeepAlives:   true,
+			TLSHandshakeTimeout: 10 * time.Second,
+		}
 	}
 
 	client := &http.Client{
@@ -246,6 +317,7 @@ func checkProxy(line, targetURL string) CheckResult {
 	res.ResponseTime = duration
 
 	if err != nil {
+		res.Error = fmt.Sprintf("Connection error: %v", err)
 		return res
 	}
 	defer resp.Body.Close()
@@ -260,6 +332,8 @@ func checkProxy(line, targetURL string) CheckResult {
 				res.Country = jsonResp.Country.Name
 			}
 		}
+	} else {
+		res.Error = fmt.Sprintf("Status code: %d", resp.StatusCode)
 	}
 
 	return res
