@@ -2,7 +2,7 @@
 Program akceptuje proxy w jednej z form:
 - `IP:PORT`
 - `IP:PORT:USER:PASS`
-- `protokół://użytkownik:hasło@IP:PORT`
+- `protocol://user:pass@IP:PORT`
 
 ### Lista flag
 
@@ -12,7 +12,7 @@ Program akceptuje proxy w jednej z form:
 | `-o` | `--output` | Plik wyjściowy (zapisuje tylko działające) | `proxy_details.csv` |
 | `-t` | `--threads` | Liczba jednoczesnych wątków | `500` |
 | `-p` | `--protocol`| Rodzaj proxy: `socks5`, `http`, `https` | `socks5` |
-| N/A | `--target` | Adres URL do testowania proxy | `https://ip.decodo.com/json` |
+|      | `--target` | Adres URL do testowania proxy | `https://ip.decodo.com/json` |
 | `-h` | `--help` | Wyświetla pomoc | `false` |
 
 ## Instrukcja dla Linux / Bash
